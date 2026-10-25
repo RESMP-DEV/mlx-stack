@@ -1,0 +1,46 @@
+# Offline Ornith QAT image. Build from a prepared context containing
+# requirements.txt, wheelhouse/, causal-conv1d.tar.gz, and the two checks.
+ARG BASE_IMAGE=tune-env:blackwell-sm120-cuda13.0.1-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+ARG USERNAME=ubuntu
+ARG MAX_JOBS=8
+ARG NVCC_THREADS=4
+ARG CUDA_ARCH=12.0
+ARG COMPUTE_CAP=120
+ARG CAUSAL_CONV1D_TARBALL=causal-conv1d.tar.gz
+
+ENV PYTORCH_CUDA_ARCH_LIST=${CUDA_ARCH} \
+    CUDAARCHES=${COMPUTE_CAP} \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+    MAX_JOBS=${MAX_JOBS} \
+    NVCC_THREADS=${NVCC_THREADS}
+
+USER root
+WORKDIR /offline
+COPY requirements.txt ./
+COPY wheelhouse/ /offline/wheelhouse/
+RUN uv pip install --python /opt/tuning/bin/python \
+      --no-index --find-links=/offline/wheelhouse \
+      -r requirements.txt
+
+COPY ${CAUSAL_CONV1D_TARBALL} /offline/
+RUN set -eux; \
+    mkdir /tmp/causal-conv1d-build; \
+    tar -xf "/offline/${CAUSAL_CONV1D_TARBALL}" -C /tmp/causal-conv1d-build --strip-components=1; \
+    cd /tmp/causal-conv1d-build; \
+    sed -i '/cc_flag.append("-gencode")/,/cc_flag.append("arch=compute_121,code=sm_121")/d' setup.py; \
+    sed -i "/cc_flag = \[\]/a\\    cc_flag.append(\"-gencode\")\n    cc_flag.append(\"arch=compute_${COMPUTE_CAP},code=sm_${COMPUTE_CAP}\")" setup.py; \
+    uv pip install --python /opt/tuning/bin/python \
+      --no-deps --no-build-isolation --no-index \
+      --find-links=/offline/wheelhouse .
+
+COPY preflight.py benchmark.py /opt/ornith-qat/
+RUN chmod 0755 /opt/ornith-qat/*.py \
+    && mkdir -p /home/${USERNAME}/.cache/{inductor,triton,torch,uv} \
+    && chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.cache
+
+USER ${USERNAME}
+ENV PATH=/opt/tuning/bin:${PATH}
+WORKDIR /workspace
+CMD ["/opt/tuning/bin/python", "-c", "import torch, transformers, fla, causal_conv1d; print(torch.__version__, transformers.__version__, fla.__version__, causal_conv1d.__version__)"]

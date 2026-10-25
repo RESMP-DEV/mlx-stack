@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-SUPPORTED_BITS = (2, 4, 8)  # bits we can bit-pack for MLX (3/5/6 use a different layout)
+SUPPORTED_BITS = (2, 4, 8)  # bit-packed MLX formats
 SUPPORTED_MODES = ("affine", "mxfp4", "mxfp8")
 MX_GROUP_SIZE = 32
 
@@ -81,27 +81,15 @@ def choose_mxfp_scale(w: torch.Tensor, mode: str):
 
 def _e2m1_codes(x: torch.Tensor) -> torch.Tensor:
     ax = x.abs()
-    mag = torch.where(
-        ax > 5.0,
-        7,
-        torch.where(
-            ax >= 3.5,
-            6,
-            torch.where(
-                ax > 2.5,
-                5,
-                torch.where(
-                    ax >= 1.75,
-                    4,
-                    torch.where(
-                        ax > 1.25,
-                        3,
-                        torch.where(ax >= 0.75, 2, torch.where(ax > 0.25, 1, 0)),
-                    ),
-                ),
-            ),
-        ),
-    ).to(torch.uint8)
+    mag = torch.zeros_like(ax, dtype=torch.uint8)
+    # Accumulate thresholds in uint8. Nested where creates large int64 temporaries.
+    mag += (ax > 0.25).to(torch.uint8)
+    mag += (ax >= 0.75).to(torch.uint8)
+    mag += (ax > 1.25).to(torch.uint8)
+    mag += (ax >= 1.75).to(torch.uint8)
+    mag += (ax > 2.5).to(torch.uint8)
+    mag += (ax >= 3.5).to(torch.uint8)
+    mag += (ax > 5.0).to(torch.uint8)
     return mag | ((x < 0).to(torch.uint8) << 3)
 
 
@@ -148,10 +136,21 @@ def rtn_quantize_mxfp(W: torch.Tensor, mode: str):
     grouped = W.reshape(*lead, rows, columns // MX_GROUP_SIZE, MX_GROUP_SIZE).float()
     scale_bytes, scales = choose_mxfp_scale(grouped, mode)
     q, dq = quantize_mxfp_with_scale(grouped, scales, mode)
-    return q.reshape(*lead, rows, columns), scale_bytes, None, dq.reshape(*lead, rows, columns)
+    return (
+        q.reshape(*lead, rows, columns),
+        scale_bytes,
+        None,
+        dq.reshape(*lead, rows, columns),
+    )
 
 
-def dequantize_artifact(q: torch.Tensor, scales: torch.Tensor, biases, mode: str, group_size: int):
+def dequantize_artifact(
+    q: torch.Tensor,
+    scales: torch.Tensor,
+    biases,
+    mode: str,
+    group_size: int,
+):
     """Dequantize one Stage-A artifact for layer-to-layer propagation."""
     if mode == "affine":
         return (
@@ -209,7 +208,12 @@ def choose_qparams(
             best_s = torch.where(better, s, best_s)
             best_b = torch.where(better, b, best_b)
 
-    return best_s.to(storage_dtype), best_b.to(storage_dtype), best_s.float(), best_b.float()
+    return (
+        best_s.to(storage_dtype),
+        best_b.to(storage_dtype),
+        best_s.float(),
+        best_b.float(),
+    )
 
 
 def quantize_with_params(w, s32, b32, bits):

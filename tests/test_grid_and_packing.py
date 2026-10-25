@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 from mlx_gptq.artifacts import pack_nibbles, unpack_nibbles
-from mlx_gptq.grid import rtn_quantize, rtn_quantize_mxfp
+from mlx_gptq.grid import _e2m1_codes, rtn_quantize, rtn_quantize_mxfp
 from mlx_gptq.packing import pack_q, unpack_q
 
 
@@ -51,6 +51,51 @@ def test_rtn_reduces_error_vs_minmax():
     _, _, _, dq_mse = rtn_quantize(W.float(), 4, 64, method="mse")
     _, _, _, dq_mm = rtn_quantize(W.float(), 4, 64, method="minmax")
     assert (dq_mse - W).norm() <= (dq_mm - W).norm() * 1.001
+
+
+def _reference_e2m1_codes(x: torch.Tensor) -> torch.Tensor:
+    """Return the E2M1 codes with the nested threshold form."""
+    ax = x.abs()
+    mag = torch.where(
+        ax > 5.0,
+        7,
+        torch.where(
+            ax >= 3.5,
+            6,
+            torch.where(
+                ax > 2.5,
+                5,
+                torch.where(
+                    ax >= 1.75,
+                    4,
+                    torch.where(
+                        ax > 1.25,
+                        3,
+                        torch.where(ax >= 0.75, 2, torch.where(ax > 0.25, 1, 0)),
+                    ),
+                ),
+            ),
+        ),
+    ).to(torch.uint8)
+    return mag | ((x < 0).to(torch.uint8) << 3)
+
+
+def test_e2m1_codes_cover_both_rounding_boundaries():
+    magnitudes = (0.0, 0.25, 0.26, 0.74, 0.75, 1.25, 1.26, 1.74, 1.75)
+    magnitudes += (2.50, 2.51, 3.49, 3.50, 4.99, 5.01, 6.0)
+    codes = _e2m1_codes(torch.tensor(magnitudes, dtype=torch.float32))
+    expected = (0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7)
+    assert torch.equal(codes, torch.tensor(expected, dtype=torch.uint8))
+
+
+def test_e2m1_codes_match_the_nested_threshold_form():
+    torch.manual_seed(31)
+    values = torch.randn(4096) * 3
+    boundaries = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32
+    )
+    samples = torch.cat([values, boundaries, -boundaries])
+    assert torch.equal(_e2m1_codes(samples), _reference_e2m1_codes(samples))
 
 
 def test_nibble_roundtrip():
