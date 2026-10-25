@@ -6,13 +6,11 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
-import os
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_URL = "http://127.0.0.1:8081/metrics"
 DEFAULT_OUTPUT = Path(
