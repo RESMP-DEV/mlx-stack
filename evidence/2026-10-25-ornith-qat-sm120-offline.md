@@ -156,8 +156,13 @@ uv run --frozen --extra dev python -m pytest -q \
 
 just quality
 # passed: root_lint, root_tests, runtime_tests, campaign_tests, cuda_compile
-# build/reports/quality/receipt.json, recorded_at 2026-10-25T23:33:40Z
+# build/reports/quality/receipt.json, recorded_at 2026-10-25T23:40:17Z
 ```
+
+One exact-head rerun exposed a one-off timeout in
+`TestL2Lifecycle.test_evict_promotes_to_l2_disk`; that single test then passed
+five consecutive targeted runs, and the final full gate above passed at the
+same clean revision.
 
 Remote logs preserved on Strix:
 
