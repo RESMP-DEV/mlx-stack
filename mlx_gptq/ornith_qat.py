@@ -20,7 +20,9 @@ The module owns four things:
 
 * ``FusedExpertsQAT`` - a drop-in replacement for ``Qwen3_5MoeExperts`` that
   keeps the upstream parameter names so a merged export reproduces the
-  original checkpoint key layout.
+  original checkpoint key layout. It routes tokens either one expert at a
+  time (the sequential reference path) or in vectorized chunks of experts
+  (the default path).
 * ``install_expert_qat_lora`` - the monkey-patch that swaps every fused expert
   module in a loaded model and freezes everything else.
 * a token-window dataset, an AdamW training loop with checkpoint/resume, and
@@ -41,7 +43,9 @@ import math
 import os
 import random
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from itertools import accumulate
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +64,7 @@ ORNITH_LAYERS = 40
 ORNITH_SEQ_LEN = 2048
 ORNITH_RANK = 16
 ORNITH_ALPHA = 32.0
+ORNITH_EXPERT_CHUNK_SIZE = 16
 
 _DTYPES = {
     "bfloat16": torch.bfloat16,
@@ -125,6 +130,66 @@ class ExpertLoRA(torch.nn.Module):
         )
 
 
+@dataclass
+class ExpertChunkPlan:
+    """One group of routed experts in the vectorized chunk path.
+
+    ``experts`` holds the expert ids of the group in ascending order and
+    ``token_counts`` holds the number of routed tokens of each of them.
+    ``max_tokens`` is the padded token count of the group, so the batched
+    matmul of the group evaluates ``len(experts) * max_tokens`` token rows
+    while only ``routed_rows`` of them carry a routed token.
+    """
+
+    experts: list[int]
+    token_counts: list[int]
+    max_tokens: int
+
+    @property
+    def padded_rows(self) -> int:
+        """Return the token rows the batched matmul of the group evaluates."""
+        return len(self.experts) * self.max_tokens
+
+    @property
+    def routed_rows(self) -> int:
+        """Return the token rows the routing of the group actually needs."""
+        return sum(self.token_counts)
+
+
+def plan_expert_chunks(
+    counts: Sequence[int], chunk_size: int
+) -> list[ExpertChunkPlan]:
+    """Group the routed experts into chunks of at most ``chunk_size`` experts.
+
+    Experts without a routed token are dropped: an empty expert would only
+    add padded rows. The remaining experts keep their ascending id order, so
+    the plan of a routing is deterministic.
+
+    A larger chunk needs fewer batched matmuls but pads every expert of the
+    chunk to the largest token count of the chunk, so the two effects trade
+    against each other. ``plan.padded_rows`` and ``plan.routed_rows`` make
+    that tradeoff measurable without a GPU.
+    """
+    if chunk_size <= 0:
+        raise ValueError("the expert chunk size must be positive")
+    hits = [
+        (expert, int(count))
+        for expert, count in enumerate(counts)
+        if int(count) > 0
+    ]
+    plans: list[ExpertChunkPlan] = []
+    for start in range(0, len(hits), chunk_size):
+        group = hits[start : start + chunk_size]
+        plans.append(
+            ExpertChunkPlan(
+                experts=[expert for expert, _ in group],
+                token_counts=[count for _, count in group],
+                max_tokens=max(count for _, count in group),
+            )
+        )
+    return plans
+
+
 class FusedExpertsQAT(torch.nn.Module):
     """Drop-in replacement for ``Qwen3_5MoeExperts`` with per-expert LoRA QAT.
 
@@ -134,11 +199,19 @@ class FusedExpertsQAT(torch.nn.Module):
     original checkpoint key layout. The LoRA factors are added as extra
     parameters.
 
-    The forward mirrors the upstream eager expert loop. It differs in two
-    ways: the effective weight of a hit expert carries a LoRA update and goes
-    through the MXFP4 fake quantizer, and the per-expert computation can be
+    Every forward differs from the upstream eager expert loop in two ways:
+    the effective weight of a hit expert carries a LoRA update and goes
+    through the MXFP4 fake quantizer, and the expert computation can be
     wrapped in gradient checkpointing so a 192-expert layer does not retain
     one quantized weight per hit expert until backward.
+
+    Two routing paths exist. The sequential path walks the routed experts
+    one at a time and is the reference and compatibility mode. The chunked
+    path groups the routed experts into groups of at most
+    ``expert_chunk_size`` experts, pads every group to the largest token
+    count of the group and evaluates the group with batched matmuls, so a
+    192-expert layer needs a handful of kernel launches instead of 192.
+    ``expert_chunk_size=0`` selects the sequential path.
     """
 
     def __init__(
@@ -148,8 +221,14 @@ class FusedExpertsQAT(torch.nn.Module):
         alpha: float = ORNITH_ALPHA,
         quantize: bool = True,
         checkpoint_experts: bool = False,
+        expert_chunk_size: int = ORNITH_EXPERT_CHUNK_SIZE,
     ) -> None:
         super().__init__()
+        if int(expert_chunk_size) < 0:
+            raise ValueError(
+                "the expert chunk size must be zero for the sequential path "
+                "or positive for the vectorized path"
+            )
         gate_up = getattr(source, "gate_up_proj", None)
         down = getattr(source, "down_proj", None)
         if not isinstance(gate_up, torch.Tensor) or gate_up.ndim != 3:
@@ -188,6 +267,8 @@ class FusedExpertsQAT(torch.nn.Module):
         self.is_concatenated = bool(getattr(source, "is_concatenated", True))
         self.quantize = bool(quantize)
         self.checkpoint_experts = bool(checkpoint_experts)
+        self.expert_chunk_size = int(expert_chunk_size)
+        self._delta_mode: str | None = None
         self.merged = False
         # Reuse the frozen parameters instead of copying them.
         self.gate_up_proj = gate_up
@@ -226,6 +307,75 @@ class FusedExpertsQAT(torch.nn.Module):
             weight = fake_quantize_mxfp4(weight)
         return weight.to(base.dtype)
 
+    def _effective_chunk(
+        self,
+        base: torch.Tensor,
+        lora: ExpertLoRA,
+        expert_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the quantized effective weights of a group of experts.
+
+        The MXFP4 group runs along the last axis, so quantizing a stacked
+        group of experts gives each expert exactly the codes the sequential
+        path computes for it.
+        """
+        if self.merged:
+            return base.index_select(0, expert_ids)
+        weight = base.index_select(0, expert_ids).float() + self._delta_stack(
+            lora, expert_ids
+        )
+        if self.quantize:
+            weight = fake_quantize_mxfp4(weight)
+        return weight.to(base.dtype)
+
+    def _delta_stack(
+        self, lora: ExpertLoRA, expert_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the scaled LoRA update of every expert of a group.
+
+        The batched product is used only when it is bit-identical to the
+        per-expert product on this device, which the probe establishes once
+        per module. Otherwise the exact per-expert product is kept, so the
+        effective weight of an expert never moves off the sequential value.
+        """
+        if self._delta_mode == "exact":
+            return torch.stack(
+                [lora.delta(int(expert)) for expert in expert_ids.tolist()]
+            )
+        return (
+            torch.bmm(
+                lora.lora_b.index_select(0, expert_ids),
+                lora.lora_a.index_select(0, expert_ids),
+            )
+            * lora.scaling
+        )
+
+    def _probe_delta_mode(self, expert_ids: torch.Tensor) -> str:
+        """Return the LoRA delta mode this device can use.
+
+        ``bmm`` is accepted only when both LoRA shapes produce their exact
+        per-expert products bit for bit, so a quantized expert weight never
+        moves off the sequential value. The probe runs once per module.
+        """
+        if self.merged or self.gate_up_lora is None:
+            return "bmm"
+        for lora in (self.gate_up_lora, self.down_lora):
+            if lora is None:
+                continue
+            batched = (
+                torch.bmm(
+                    lora.lora_b.index_select(0, expert_ids),
+                    lora.lora_a.index_select(0, expert_ids),
+                )
+                * lora.scaling
+            )
+            exact = torch.stack(
+                [lora.delta(int(expert)) for expert in expert_ids.tolist()]
+            )
+            if not torch.equal(batched, exact):
+                return "exact"
+        return "bmm"
+
     def freeze_merged(self) -> None:
         """Drop the adapter once its update is merged into the base weight.
 
@@ -251,13 +401,17 @@ class FusedExpertsQAT(torch.nn.Module):
         output = F.linear(hidden, down)
         return output * top_k_weights[token_index, top_k_position, None]
 
-    def forward(
+    def _sequential_forward(
         self,
         hidden_states: torch.Tensor,
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Route tokens to experts with quantized per-expert LoRA weights."""
+        """Route tokens to experts one expert at a time.
+
+        This is the reference path: it keeps the upstream eager loop and is
+        the compatibility mode of the trainer.
+        """
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
             expert_mask = F.one_hot(
@@ -294,11 +448,148 @@ class FusedExpertsQAT(torch.nn.Module):
             )
         return final_hidden_states
 
+    def _chunked_forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Route tokens to experts in vectorized chunks of experts.
+
+        The routing is flattened, sorted by expert and grouped into chunks of
+        at most ``expert_chunk_size`` experts. Every chunk is padded to the
+        largest token count of the chunk and evaluated with batched
+        matmuls, so the number of kernel launches per layer drops from one
+        per routed expert to one per chunk.
+        """
+        final_hidden_states = torch.zeros_like(hidden_states)
+        tokens = hidden_states.shape[0]
+        top_k = top_k_index.shape[1]
+        if tokens == 0 or top_k == 0:
+            return final_hidden_states
+        device = hidden_states.device
+        flat_expert = top_k_index.reshape(-1)
+        flat_token = torch.arange(tokens, device=device).repeat_interleave(top_k)
+        flat_weight = top_k_weights.reshape(-1)
+        in_range = (flat_expert >= 0) & (flat_expert < self.num_experts)
+        safe_expert = torch.where(
+            in_range,
+            flat_expert,
+            torch.full_like(flat_expert, self.num_experts),
+        )
+        sorted_expert, order = torch.sort(safe_expert, stable=True)
+        sorted_token = flat_token[order]
+        sorted_weight = flat_weight[order]
+        counts = torch.bincount(sorted_expert, minlength=self.num_experts + 1)
+        counts_host = counts.tolist()
+        routed_counts = counts_host[: self.num_experts]
+        plans = plan_expert_chunks(routed_counts, self.expert_chunk_size)
+        if not plans:
+            return final_hidden_states
+        offsets = [0] + list(accumulate(routed_counts))
+        for plan in plans:
+            expert_ids = torch.tensor(
+                plan.experts, dtype=torch.long, device=device
+            )
+            if self._delta_mode is None:
+                self._delta_mode = self._probe_delta_mode(expert_ids)
+            starts = torch.tensor(
+                [offsets[expert] for expert in plan.experts],
+                dtype=torch.long,
+                device=device,
+            )
+            counts_tensor = torch.tensor(
+                plan.token_counts, dtype=torch.long, device=device
+            )
+            positions = torch.arange(plan.max_tokens, device=device)
+            gather = starts.unsqueeze(1) + positions.unsqueeze(0)
+            keep = positions.unsqueeze(0) < counts_tensor.unsqueeze(1)
+            gather = torch.where(keep, gather, torch.zeros_like(gather))
+            token_index = sorted_token[gather]
+            token_weight = sorted_weight[gather]
+            mask = keep.to(hidden_states.dtype)
+            output = self._run_chunk(
+                hidden_states, expert_ids, token_index, token_weight, mask
+            )
+            final_hidden_states.index_add_(
+                0,
+                token_index.reshape(-1),
+                output.reshape(-1, hidden_states.shape[-1]),
+            )
+        return final_hidden_states
+
+    def _run_chunk(
+        self,
+        hidden_states: torch.Tensor,
+        expert_ids: torch.Tensor,
+        token_index: torch.Tensor,
+        token_weight: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate one chunk of experts, with or without checkpointing."""
+        if self.checkpoint_experts and torch.is_grad_enabled():
+            return checkpoint(
+                self._chunk_forward,
+                hidden_states,
+                expert_ids,
+                token_index,
+                token_weight,
+                mask,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        return self._chunk_forward(
+            hidden_states, expert_ids, token_index, token_weight, mask
+        )
+
+    def _chunk_forward(
+        self,
+        hidden_states: torch.Tensor,
+        expert_ids: torch.Tensor,
+        token_index: torch.Tensor,
+        token_weight: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate the experts of one chunk with batched matmuls.
+
+        ``token_index`` holds the routed token of every padded row and
+        ``mask`` marks the rows that carry a routed token, so the padded rows
+        contribute nothing to the routed output.
+        """
+        state = hidden_states[token_index]
+        gate_up = self._effective_chunk(
+            self.gate_up_proj, self.gate_up_lora, expert_ids
+        )
+        intermediate = gate_up.shape[1] // 2
+        gate = torch.bmm(state, gate_up[:, :intermediate, :].transpose(1, 2))
+        up = torch.bmm(state, gate_up[:, intermediate:, :].transpose(1, 2))
+        hidden = self.act_fn(gate) * up
+        down = self._effective_chunk(self.down_proj, self.down_lora, expert_ids)
+        output = torch.bmm(hidden, down.transpose(1, 2))
+        scale = token_weight.unsqueeze(-1) * mask.unsqueeze(-1)
+        return (output * scale).to(hidden_states.dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Route tokens to experts with quantized per-expert LoRA weights."""
+        if self.expert_chunk_size > 0:
+            return self._chunked_forward(
+                hidden_states, top_k_index, top_k_weights
+            )
+        return self._sequential_forward(
+            hidden_states, top_k_index, top_k_weights
+        )
+
     def extra_repr(self) -> str:
         return (
             f"experts={self.num_experts}, hidden={self.hidden_dim}, "
             f"intermediate={self.intermediate_dim}, quantize={self.quantize}, "
-            f"checkpoint_experts={self.checkpoint_experts}"
+            f"checkpoint_experts={self.checkpoint_experts}, "
+            f"expert_chunk_size={self.expert_chunk_size}"
         )
 
 
@@ -344,6 +635,7 @@ def install_expert_qat_lora(
     alpha: float = ORNITH_ALPHA,
     quantize: bool = True,
     checkpoint_experts: bool = False,
+    expert_chunk_size: int = ORNITH_EXPERT_CHUNK_SIZE,
 ) -> list[InstalledAdapter]:
     """Swap every fused routed-expert module for a LoRA QAT adapter.
 
@@ -373,6 +665,7 @@ def install_expert_qat_lora(
             alpha=alpha,
             quantize=quantize,
             checkpoint_experts=checkpoint_experts,
+            expert_chunk_size=expert_chunk_size,
         )
         setattr(parent, child_name, adapter)
         trainable = sum(
@@ -664,6 +957,7 @@ class TrainConfig:
     seed: int = 17
     quantize: bool = True
     checkpoint_experts: bool = True
+    expert_chunk_size: int = ORNITH_EXPERT_CHUNK_SIZE
     gradient_checkpointing: bool = False
     device: str = "cuda"
     dtype: str = "bfloat16"
@@ -1072,6 +1366,7 @@ def train(config: TrainConfig) -> dict[str, Any]:
         alpha=config.alpha,
         quantize=config.quantize,
         checkpoint_experts=config.checkpoint_experts,
+        expert_chunk_size=config.expert_chunk_size,
     )
     parameters = adapter_parameters(model)
     if not parameters:
@@ -1089,6 +1384,7 @@ def train(config: TrainConfig) -> dict[str, Any]:
         "dtype": config.dtype,
         "quantize_mxfp4": config.quantize,
         "checkpoint_experts": config.checkpoint_experts,
+        "expert_chunk_size": config.expert_chunk_size,
     }
     if config.dry_run:
         summary = {
@@ -1287,6 +1583,15 @@ def build_parser() -> argparse.ArgumentParser:
     trainer.add_argument("--max-tokens", type=int, default=0)
     trainer.add_argument("--no-quantize", action="store_true")
     trainer.add_argument("--no-checkpoint-experts", action="store_true")
+    trainer.add_argument(
+        "--expert-chunk-size",
+        type=int,
+        default=ORNITH_EXPERT_CHUNK_SIZE,
+        help=(
+            "experts per vectorized chunk; 0 selects the sequential "
+            "reference path"
+        ),
+    )
     trainer.add_argument("--gradient-checkpointing", action="store_true")
     trainer.add_argument("--no-resume", action="store_false", dest="resume")
     trainer.add_argument("--dry-run", action="store_true")
@@ -1346,6 +1651,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             quantize=not args.no_quantize,
             checkpoint_experts=not args.no_checkpoint_experts,
+            expert_chunk_size=args.expert_chunk_size,
             gradient_checkpointing=args.gradient_checkpointing,
             device=args.device,
             dtype=args.dtype,

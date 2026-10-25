@@ -5,6 +5,7 @@ weight, claims GPU execution, or measures model quality.
 """
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ from mlx_gptq.ornith_qat import (
     lora_parameter_budget,
     merged_state_dict,
     mxfp4_codes,
+    plan_expert_chunks,
     preflight,
     train,
     training_fingerprint,
@@ -229,6 +231,270 @@ def test_gradient_reaches_every_expert():
         assert float(module.down_lora.lora_b.grad[expert].abs().sum()) > 0.0
 
 
+def _random_routing(tokens: int, top_k: int, experts: int, seed: int = 0):
+    """Return a random routing that visits every expert at least once."""
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randint(experts, (tokens, top_k), generator=generator)
+    for expert in range(experts):
+        indices[expert % tokens, 0] = expert
+    return indices
+
+
+def _synthetic_experts(experts: int, hidden: int, intermediate: int):
+    """Return a fused-expert source module with the Ornith weight layout."""
+
+    class _Source(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = torch.nn.Parameter(
+                torch.randn(experts, 2 * intermediate, hidden) * 0.02
+            )
+            self.down_proj = torch.nn.Parameter(
+                torch.randn(experts, hidden, intermediate) * 0.02
+            )
+            self.act_fn = torch.nn.SiLU()
+            self.num_experts = experts
+            self.hidden_dim = hidden
+            self.intermediate_dim = intermediate
+            self.has_gate = True
+            self.has_bias = False
+            self.is_concatenated = True
+            self.is_transposed = False
+
+    return _Source()
+
+
+def test_expert_chunk_plan_exposes_the_padding_tradeoff():
+    counts = [12, 0, 30, 28, 31, 0, 9]
+    small = plan_expert_chunks(counts, 2)
+    large = plan_expert_chunks(counts, 4)
+    assert [plan.experts for plan in small] == [[0, 2], [3, 4], [6]]
+    assert [plan.token_counts for plan in small] == [[12, 30], [28, 31], [9]]
+    assert [plan.max_tokens for plan in small] == [30, 31, 9]
+    assert small[0].routed_rows == 42
+    assert small[0].padded_rows == 60
+    # A bigger chunk needs fewer batched matmuls but pads more rows.
+    assert len(large) < len(small)
+    assert sum(plan.padded_rows for plan in large) > sum(
+        plan.padded_rows for plan in small
+    )
+    assert sum(plan.routed_rows for plan in large) == sum(
+        plan.routed_rows for plan in small
+    )
+    with pytest.raises(ValueError, match="chunk size"):
+        plan_expert_chunks(counts, 0)
+
+
+def test_chunked_forward_matches_the_sequential_forward():
+    model = _tiny_model()
+    install_expert_qat_lora(model, rank=4, alpha=8.0, expert_chunk_size=0)
+    module = model.model.layers[0].mlp.experts
+    with torch.no_grad():
+        module.gate_up_lora.lora_b.normal_(0.0, 0.02)
+        module.down_lora.lora_b.normal_(0.0, 0.02)
+    tokens = 16
+    generator = torch.Generator().manual_seed(4)
+    hidden = torch.randn(tokens, HIDDEN, generator=generator)
+    top_k_index = _random_routing(tokens, 2, EXPERTS, seed=9)
+    top_k_weights = torch.rand(tokens, 2, generator=generator)
+
+    module.expert_chunk_size = 0
+    sequential = module(hidden, top_k_index, top_k_weights)
+    for chunk_size in (1, 2, 3, EXPERTS, 16):
+        module.expert_chunk_size = chunk_size
+        chunked = module(hidden, top_k_index, top_k_weights)
+        assert torch.allclose(sequential, chunked, atol=1e-5, rtol=1e-4)
+        module.checkpoint_experts = True
+        checkpointed = module(hidden, top_k_index, top_k_weights)
+        module.checkpoint_experts = False
+        assert torch.allclose(sequential, checkpointed, atol=1e-5, rtol=1e-4)
+
+
+def test_chunked_effective_weights_are_bit_identical():
+    model = _tiny_model()
+    install_expert_qat_lora(model, rank=4, alpha=8.0)
+    module = model.model.layers[0].mlp.experts
+    with torch.no_grad():
+        module.gate_up_lora.lora_b.normal_(0.0, 0.02)
+        module.down_lora.lora_b.normal_(0.0, 0.02)
+    expert_ids = torch.arange(EXPERTS)
+    per_expert = torch.stack(
+        [module.effective_gate_up(int(expert)) for expert in expert_ids]
+    )
+    chunked = module._effective_chunk(
+        module.gate_up_proj, module.gate_up_lora, expert_ids
+    )
+    assert torch.equal(per_expert, chunked)
+    per_expert_down = torch.stack(
+        [module.effective_down(int(expert)) for expert in expert_ids]
+    )
+    chunked_down = module._effective_chunk(
+        module.down_proj, module.down_lora, expert_ids
+    )
+    assert torch.equal(per_expert_down, chunked_down)
+    # The exact fallback keeps the same values when the batched product is
+    # not bit-identical on the device.
+    module._delta_mode = "exact"
+    fallback = module._effective_chunk(
+        module.gate_up_proj, module.gate_up_lora, expert_ids
+    )
+    assert torch.equal(per_expert, fallback)
+
+
+def test_chunked_gradient_reaches_every_selected_expert():
+    model = _tiny_model()
+    install_expert_qat_lora(model, rank=4, alpha=8.0)
+    module = model.model.layers[0].mlp.experts
+    tokens = 12
+    generator = torch.Generator().manual_seed(6)
+    hidden = torch.randn(tokens, HIDDEN, generator=generator)
+    top_k_index = _random_routing(tokens, 2, EXPERTS, seed=2)
+    top_k_weights = torch.rand(tokens, 2, generator=generator)
+    module.expert_chunk_size = 2
+    module(hidden, top_k_index, top_k_weights).sum().backward()
+    selected = sorted({int(expert) for expert in top_k_index.reshape(-1)})
+    assert selected
+    for expert in selected:
+        assert float(module.gate_up_lora.lora_b.grad[expert].abs().sum()) > 0.0
+        assert float(module.down_lora.lora_b.grad[expert].abs().sum()) > 0.0
+    for expert in range(EXPERTS):
+        if expert in selected:
+            continue
+        assert float(module.gate_up_lora.lora_b.grad[expert].abs().sum()) == 0.0
+        assert float(module.down_lora.lora_b.grad[expert].abs().sum()) == 0.0
+
+
+def test_chunked_and_sequential_gradients_agree():
+    model = _tiny_model()
+    install_expert_qat_lora(model, rank=4, alpha=8.0)
+    module = model.model.layers[0].mlp.experts
+    with torch.no_grad():
+        module.gate_up_lora.lora_b.normal_(0.0, 0.02)
+        module.down_lora.lora_b.normal_(0.0, 0.02)
+    tokens = 16
+    generator = torch.Generator().manual_seed(8)
+    hidden = torch.randn(tokens, HIDDEN, generator=generator)
+    top_k_index = _random_routing(tokens, 2, EXPERTS, seed=5)
+    top_k_weights = torch.rand(tokens, 2, generator=generator)
+    grads = []
+    for chunk_size in (0, 2, 4):
+        module.expert_chunk_size = chunk_size
+        module.zero_grad(set_to_none=True)
+        module(hidden, top_k_index, top_k_weights).pow(2).sum().backward()
+        grads.append(
+            (
+                module.gate_up_lora.lora_b.grad.clone(),
+                module.down_lora.lora_b.grad.clone(),
+            )
+        )
+    for gate_up_grad, down_grad in grads[1:]:
+        assert torch.allclose(grads[0][0], gate_up_grad, atol=1e-5, rtol=1e-4)
+        assert torch.allclose(grads[0][1], down_grad, atol=1e-5, rtol=1e-4)
+
+
+def test_chunked_forward_ignores_the_drop_bucket():
+    model = _tiny_model()
+    install_expert_qat_lora(model, rank=4, alpha=8.0)
+    module = model.model.layers[0].mlp.experts
+    tokens = 8
+    generator = torch.Generator().manual_seed(11)
+    hidden = torch.randn(tokens, HIDDEN, generator=generator)
+    top_k_index = _random_routing(tokens, 2, EXPERTS, seed=7)
+    top_k_index[0, 0] = EXPERTS
+    top_k_weights = torch.rand(tokens, 2, generator=generator)
+    module.expert_chunk_size = 2
+    chunked = module(hidden, top_k_index, top_k_weights)
+    module.expert_chunk_size = 0
+    sequential = module(hidden, top_k_index, top_k_weights)
+    assert torch.allclose(chunked, sequential, atol=1e-5, rtol=1e-4)
+def test_expert_chunk_size_knob_reaches_the_module_and_the_cli():
+    model = _tiny_model()
+    install_expert_qat_lora(model, rank=4, alpha=8.0, expert_chunk_size=8)
+    module = model.model.layers[0].mlp.experts
+    assert module.expert_chunk_size == 8
+    assert "expert_chunk_size=8" in module.extra_repr()
+    parser = ornith_qat.build_parser()
+    parsed = parser.parse_args(
+        ["train", "--model", "m", "--data", "d", "--expert-chunk-size", "8"]
+    )
+    assert parsed.expert_chunk_size == 8
+    default = parser.parse_args(["train", "--model", "m", "--data", "d"])
+    assert default.expert_chunk_size == ornith_qat.ORNITH_EXPERT_CHUNK_SIZE
+    assert TrainConfig().expert_chunk_size == ornith_qat.ORNITH_EXPERT_CHUNK_SIZE
+    with pytest.raises(ValueError, match="chunk size"):
+        FusedExpertsQAT(
+            model.model.layers[0].mlp.experts, rank=4, alpha=8.0,
+            expert_chunk_size=-1,
+        )
+
+
+def test_train_reports_the_expert_chunk_size(tmp_path):
+    config, _ = _prepare_run(tmp_path)
+    dry = TrainConfig(
+        **{**config.as_dict(), "expert_chunk_size": 4, "dry_run": True}
+    )
+    summary = train(dry)
+    assert summary["expert_chunk_size"] == 4
+
+
+def test_chunk_size_tradeoff_benchmark():
+    """Expose the chunk-size tradeoff on a synthetic layer, without a GPU.
+
+    The shape keeps the structure of the Ornith layer (many experts, a
+    grouped token count) but is small enough to run on CPU. The printed
+    table is the measurement; the assertions only pin the numerics.
+    """
+    experts, hidden, intermediate = 64, 256, 64
+    tokens, top_k = 512, 8
+    torch.manual_seed(21)
+    source = _synthetic_experts(experts, hidden, intermediate)
+    generator = torch.Generator().manual_seed(22)
+    hidden_states = torch.randn(tokens, hidden, generator=generator)
+    top_k_index = torch.randint(
+        experts, (tokens, top_k), generator=generator
+    )
+    top_k_weights = torch.rand(tokens, top_k, generator=generator)
+    routed = torch.bincount(top_k_index.reshape(-1), minlength=experts).tolist()
+    module = FusedExpertsQAT(
+        source,
+        rank=8,
+        alpha=16.0,
+        quantize=True,
+        checkpoint_experts=False,
+        expert_chunk_size=0,
+    )
+    with torch.no_grad():
+        module.gate_up_lora.lora_b.normal_(0.0, 0.02)
+        module.down_lora.lora_b.normal_(0.0, 0.02)
+    rows = []
+    reference = None
+    for chunk_size in (0, 8, 16, 32, 64):
+        module.expert_chunk_size = chunk_size
+        module.zero_grad(set_to_none=True)
+        start = time.perf_counter()
+        output = module(hidden_states, top_k_index, top_k_weights)
+        output.pow(2).sum().backward()
+        elapsed = time.perf_counter() - start
+        if reference is None:
+            reference = output.detach()
+        else:
+            assert torch.allclose(reference, output.detach(), atol=1e-4, rtol=1e-3)
+        if chunk_size:
+            plans = plan_expert_chunks(routed, chunk_size)
+            chunks = len(plans)
+            padded = sum(plan.padded_rows for plan in plans)
+        else:
+            chunks, padded = experts, sum(routed)
+        rows.append((chunk_size, chunks, padded, elapsed))
+    print("\nchunk_size chunks padded_rows seconds")
+    for chunk_size, chunks, padded, elapsed in rows:
+        print(f"{chunk_size:>10} {chunks:>6} {padded:>11} {elapsed:>7.4f}")
+    assert rows[0][1] == experts
+    assert [row[1] for row in rows[1:]] == sorted(
+        [row[1] for row in rows[1:]], reverse=True
+    )
+    assert rows[-1][1] == 1
+    assert all(row[2] >= sum(routed) for row in rows)
 def test_adapter_rejects_a_mismatched_expert_layout():
     class _FakeExperts(torch.nn.Module):
         def __init__(self):
