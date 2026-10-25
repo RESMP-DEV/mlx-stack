@@ -215,6 +215,18 @@ provenance and non-claims is not accepted.
   transport proof, not general quality or savings. See
   `evidence/2026-10-23-flint-reasoning-entropy.md`.
 
+## 2026-10-24 work log
+
+- Added a 3D-aware routed-expert MXFP4 QAT trainer for Qwen3.5-MoE fused
+  expert tensors, with per-expert LoRA, straight-through MXFP4 fake
+  quantization, token-window training, resume fingerprints, stock-layout
+  merge export, and 21 synthetic tests. A real one-step and bounded 100-step
+  run on a Packet RTX PRO 6000 96GB completed at sequence length 2,048,
+  processing 204,800 context tokens with 66,558 MiB peak VRAM and preserving
+  a local adapter plus optimizer checkpoint. This is execution and memory
+  proof, not a quality-recovery result. See
+  `evidence/2026-10-24-ornith-qat-rtxpro6000-100step.md`.
+
 ## Contracts to preserve
 
 - E2M1 uint32 words use MLX's LSB-first `4*i` layout; byte operands use low
